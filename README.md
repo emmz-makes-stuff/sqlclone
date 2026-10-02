@@ -120,6 +120,19 @@ The test then compares source and clone by catalog: objects, module text hashes,
 constraints, triggers, types, synonyms, sequences, identity values and extended properties. For data, it compares
 a row count and an order-independent SHA-256 per table. On Apple Silicon the image runs under Rosetta.
 
+## Releasing
+
+Push a version tag. `.github/workflows/publish.yaml` builds with that version, runs the integration tests and
+pushes the package to nuget.org:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Publishing uses nuget.org [trusted publishing](https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing),
+so no API key is stored anywhere. The repository needs a `NUGET_USER` secret holding the nuget.org profile name, and
+the trusted publishing policy must name the workflow file `publish.yaml`.
+
 ## License
 
 [Mozilla Public License 2.0](LICENSE).
