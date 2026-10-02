@@ -14,6 +14,7 @@
     <Version>0.1.0</Version>
     <Authors>Emmz</Authors>
     <Description>Clone a SQL Server database, schema and data, from one server to another under a new name.</Description>
+    <PackageLicenseExpression>MPL-2.0</PackageLicenseExpression>
     <PackageTags>sqlserver;clone;database;dotnet-tool</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageOutputPath>$(MSBuildThisFileDirectory)../../artifacts</PackageOutputPath>

@@ -27,6 +27,25 @@ dotnet pack src/SqlClone -c Release          # writes artifacts/SqlClone.<versio
 dotnet tool install --global SqlClone --add-source ./artifacts
 ```
 
+## A SQL Server to try it against
+
+`compose.yaml` runs a SQL Server 2025 Developer instance on port **1434** (so it runs alongside one already on
+1433), with a `sysadmin` login named `emmz`:
+
+```sh
+docker compose up -d      # docker compose down -v removes it and its data
+sqlcmd -S localhost,1434 -U emmz -P 'S3cr3tSqu!rr3l' -C
+```
+
+```
+Server=localhost,1434;User Id=emmz;Password=S3cr3tSqu!rr3l;TrustServerCertificate=True
+```
+
+The image only creates `sa` (given the same password). A short-lived `init` container adds the `emmz` login once
+the server is healthy. `TrustServerCertificate=True` (or `-C` for sqlcmd) is needed because the certificate is
+self-signed. In a shell, single-quote connection strings so that the `!` isn't treated as history expansion. The
+instance starts empty.
+
 ## How it works
 
 1. **Database.** The tool creates the target database with the source's collation and compatibility level.
@@ -100,3 +119,7 @@ Loading the samples involves a few workarounds, all in `SqlServerFixture`:
 The test then compares source and clone by catalog: objects, module text hashes, columns, indexes, keys,
 constraints, triggers, types, synonyms, sequences, identity values and extended properties. For data, it compares
 a row count and an order-independent SHA-256 per table. On Apple Silicon the image runs under Rosetta.
+
+## License
+
+[Mozilla Public License 2.0](LICENSE).

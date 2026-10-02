@@ -1,0 +1,53 @@
+# A SQL Server 2025 instance for trying sqlclone by hand:
+#   docker compose up -d
+#   Server=localhost,1434;User Id=emmz;Password=S3cr3tSqu!rr3l;TrustServerCertificate=True
+#
+# The image only creates `sa` (given the same password here); `init` adds the `emmz` login once the server is up.
+
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    platform: linux/amd64
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: "S3cr3tSqu!rr3l"
+    ports:
+      - "1434:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  init:
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    platform: linux/amd64
+    depends_on:
+      mssql:
+        condition: service_healthy
+    environment:
+      MSSQL_SA_PASSWORD: "S3cr3tSqu!rr3l"
+    entrypoint:
+      - /opt/mssql-tools18/bin/sqlcmd
+      - -C
+      - -S
+      - mssql
+      - -U
+      - sa
+      - -P
+      - "S3cr3tSqu!rr3l"
+      - -b
+      - -Q
+      - >-
+        IF SUSER_ID(N'emmz') IS NULL
+        CREATE LOGIN [emmz] WITH PASSWORD = N'S3cr3tSqu!rr3l', CHECK_POLICY = OFF;
+        IF IS_SRVROLEMEMBER(N'sysadmin', N'emmz') = 0
+        ALTER SERVER ROLE [sysadmin] ADD MEMBER [emmz];
+    restart: "no"
+
+volumes:
+  mssql-data:
