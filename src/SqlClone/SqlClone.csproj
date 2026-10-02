@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>SqlClone</RootNamespace>
+    <AssemblyName>sqlclone</AssemblyName>
+
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>sqlclone</ToolCommandName>
+    <PackageId>SqlClone</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Emmz</Authors>
+    <Description>Clone a SQL Server database, schema and data, from one server to another under a new name.</Description>
+    <PackageTags>sqlserver;clone;database;dotnet-tool</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageOutputPath>$(MSBuildThisFileDirectory)../../artifacts</PackageOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SqlServer.SqlManagementObjects" Version="181.37.1" />
+    <PackageReference Include="System.CommandLine" Version="2.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+</Project>

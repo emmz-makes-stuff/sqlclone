@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SqlClone/SqlClone.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SqlClone.IntegrationTests/SqlClone.IntegrationTests.csproj" />
+  </Folder>
+</Solution>
