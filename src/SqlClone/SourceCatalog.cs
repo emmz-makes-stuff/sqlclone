@@ -46,13 +46,16 @@ internal sealed record SourceFeatures(
     bool HasExternalTables,         // sys.tables.is_external, 2016
     bool HasGeneratedAlwaysColumns, // sys.columns.generated_always_type, 2016
     bool HasGraphColumns,           // sys.columns.graph_type, 2017
-    bool HasSequences)              // sys.sequences, 2012
+    bool HasSequences,              // sys.sequences, 2012
+    bool HasSequenceLastUsedValue)  // sys.sequences.last_used_value, 2017
 {
     public static Task<SourceFeatures> ProbeAsync(SqlConnection connection, CancellationToken ct) =>
         SourceCatalog.SingleAsync(connection, """
             SELECT COL_LENGTH('sys.tables', 'is_external'), COL_LENGTH('sys.columns', 'generated_always_type'),
-                   COL_LENGTH('sys.columns', 'graph_type'), OBJECT_ID('sys.sequences')
-            """, r => new SourceFeatures(!r.IsDBNull(0), !r.IsDBNull(1), !r.IsDBNull(2), !r.IsDBNull(3)), ct);
+                   COL_LENGTH('sys.columns', 'graph_type'), OBJECT_ID('sys.sequences'),
+                   COL_LENGTH('sys.sequences', 'last_used_value')
+            """, r => new SourceFeatures(!r.IsDBNull(0), !r.IsDBNull(1), !r.IsDBNull(2), !r.IsDBNull(3),
+                !r.IsDBNull(4)), ct);
 }
 
 /// <summary>Reads everything about the source database that is taken from the catalog views rather than SMO.</summary>
@@ -155,11 +158,13 @@ internal sealed class SourceCatalog
         ORDER BY t.object_id
         """;
 
+    // Before last_used_value there's no telling whether a sequence has been used, so every one is restored. One that
+    // never was then skips its start value on the clone: a gap, where the alternative risks repeating a used value.
     internal static string? SequencesQuery(SourceFeatures features) => features.HasSequences
-        ? """
+        ? $"""
           SELECT s.name, sq.name, CONVERT(nvarchar(50), sq.current_value)
           FROM sys.sequences sq JOIN sys.schemas s ON s.schema_id = sq.schema_id
-          WHERE sq.is_ms_shipped = 0 AND sq.last_used_value IS NOT NULL
+          WHERE sq.is_ms_shipped = 0 {(features.HasSequenceLastUsedValue ? "AND sq.last_used_value IS NOT NULL" : "")}
           """
         : null;
 

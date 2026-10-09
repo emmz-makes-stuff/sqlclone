@@ -8,17 +8,27 @@ namespace SqlClone.IntegrationTests;
 /// </summary>
 public sealed class SourceCatalogQueryTests
 {
-    private static readonly SourceFeatures None = new(false, false, false, false);
-    private static readonly SourceFeatures All = new(true, true, true, true);
+    private static readonly SourceFeatures None = new(false, false, false, false, false);
+    private static readonly SourceFeatures All = new(true, true, true, true, true);
 
     [Fact]
     public void Without_the_features_the_queries_name_none_of_their_columns_or_views()
     {
         string[] queries = [SourceCatalog.TablesQuery(None), SourceCatalog.CopyableColumnsQuery(None)];
 
-        foreach (var name in new[] { "is_external", "generated_always_type", "graph_type", "sys.sequences" })
+        foreach (var name in new[] { "is_external", "generated_always_type", "graph_type", "sys.sequences", "last_used_value" })
             Assert.All(queries, q => Assert.DoesNotContain(name, q, StringComparison.OrdinalIgnoreCase));
         Assert.Null(SourceCatalog.SequencesQuery(None));
+    }
+
+    [Fact]
+    public void Before_SQL_Server_2017_every_sequence_is_read()
+    {
+        // SQL Server 2012 to 2016: sys.sequences exists, its last_used_value column doesn't.
+        var query = SourceCatalog.SequencesQuery(All with { HasSequenceLastUsedValue = false });
+
+        Assert.NotNull(query);
+        Assert.DoesNotContain("last_used_value", query, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
