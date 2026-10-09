@@ -54,7 +54,8 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
             errors.AddRange(await ScriptExecutor.ExecuteAsync(target, preData, ct));
 
             log.Info($"Copying data for {catalog.Tables.Count} tables...");
-            var copied = await new DataCopier(options.SourceConnectionString, targetConnectionString, options.Parallelism, log)
+            var copied = await new DataCopier(options.SourceConnectionString, targetConnectionString, catalog.Features,
+                    options.Parallelism, log)
                 .CopyAsync(catalog.Tables, ct);
             log.Info($"Copied {copied.Values.Sum():N0} rows.");
 
@@ -87,7 +88,8 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
         if (!string.Equals(sourceDatabase, options.TargetDatabase, StringComparison.OrdinalIgnoreCase)) return;
 
         // tempdb is recreated whenever an instance starts, so its create_date tells two instances apart.
-        const string instanceId = "SELECT CONCAT(@@SERVERNAME, '|', CONVERT(nvarchar(30), create_date, 126)) FROM sys.databases WHERE name = 'tempdb'";
+        // Plain + rather than CONCAT, which a source older than SQL Server 2012 doesn't have.
+        const string instanceId = "SELECT ISNULL(@@SERVERNAME, '') + '|' + CONVERT(nvarchar(30), create_date, 126) FROM sys.databases WHERE name = 'tempdb'";
         if (await ScalarAsync<string>(source, instanceId, ct) == await ScalarAsync<string>(master, instanceId, ct))
             throw new CloneException("The target database is the source database.");
     }

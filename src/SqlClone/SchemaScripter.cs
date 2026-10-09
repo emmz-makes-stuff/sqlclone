@@ -80,8 +80,10 @@ internal sealed class SchemaScripter(Database database, SourceCatalog catalog)
         foreach (UserDefinedTableType t in database.UserDefinedTableTypes)
             units.Add(Unit($"table type {Sql.Quote(t.Schema, t.Name)}", t.Script(_tableTypeOptions)));
 
-        foreach (Sequence s in database.Sequences)
-            units.Add(Unit($"sequence {Sql.Quote(s.Schema, s.Name)}", s.Script(_objectOptions)));
+        // Don't touch SMO's Sequences collection on a source older than SQL Server 2012.
+        if (catalog.Features.HasSequences)
+            foreach (Sequence s in database.Sequences)
+                units.Add(Unit($"sequence {Sql.Quote(s.Schema, s.Name)}", s.Script(_objectOptions)));
 
         database.PrefetchObjects(typeof(Table), _tableOptions);
         foreach (var t in catalog.Tables)
