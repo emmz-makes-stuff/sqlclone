@@ -3,7 +3,8 @@
 A `dotnet tool` that clones a SQL Server database (every object and all of its data) onto another server under a
 new name.
 
-The source server can be SQL Server 2008 R2 or later. The integration tests run against SQL Server 2025 only.
+The source server can be SQL Server 2008 R2 or later. It has been tried against SQL Server 2014 and 2025 sources;
+2008 R2 and 2012 should work but are untested. The integration tests run against SQL Server 2025 only.
 
 ```sh
 sqlclone --source "Server=src,1433;Database=Sales;User Id=sa;Password=...;TrustServerCertificate=True" \
