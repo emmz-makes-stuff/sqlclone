@@ -31,7 +31,7 @@ public static class Cli
         };
         var force = new Option<bool>("--force", "-f")
         {
-            Description = "Drop the target database first if it already exists.",
+            Description = "Drop the target database first if it already exists and isn't empty.",
         };
         var parallelism = new Option<int>("--parallelism", "-p")
         {

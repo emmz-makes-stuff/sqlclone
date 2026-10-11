@@ -16,11 +16,11 @@ sqlclone --source "Server=src,1433;Database=Sales;User Id=sa;Password=...;TrustS
 |---|---|---|
 | `-s`, `--source` | required | Connection string for the source database. It must name the database. |
 | `-t`, `--target` | required | Connection string for the target server. Any database in it is ignored. |
-| `-n`, `--name` | required | Name of the new database on the target server. |
-| `-f`, `--force` | | Drop the target database first if it already exists. Without it, an existing database is an error. |
+| `-n`, `--name` | required | Name of the database on the target server. It is created, unless it already exists and is empty. |
+| `-f`, `--force` | | Drop the target database first if it already exists and isn't empty. Without it, that is an error. |
 | `-p`, `--parallelism` | default `4` | Number of tables copied at the same time. |
 
-Exit codes: `0` success; `1` the clone could not run (connection failure, target exists, ...); `2` the clone ran
+Exit codes: `0` success; `1` the clone could not run (connection failure, target not empty, ...); `2` the clone ran
 but some objects failed, and each one is listed on stderr.
 
 ## Install
@@ -52,6 +52,12 @@ instance starts empty.
 ## How it works
 
 1. **Database.** The tool creates the target database with the source's collation and compatibility level.
+
+   If a database with that name already exists and is empty, the tool fills it instead. Empty means it has no user
+   objects, schemas, types, XML schema collections or database triggers. Users and roles don't count. The tool
+   changes the database's collation and compatibility level to match the source's, and if the login isn't allowed
+   to, it prints a warning and keeps going. A login that can't connect to `master` (a contained user, for example)
+   can only clone into a database that already exists.
 2. **Schema, before data.** Schemas, XML schema collections, alias and table types, rules and defaults, sequences,
    tables (with primary keys and defaults only), synonyms, functions, views and procedures. SMO scripts the
    declarative objects. Programmable objects are copied verbatim from `sys.sql_modules` together with their

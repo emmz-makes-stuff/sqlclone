@@ -34,11 +34,8 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
         foreach (var m in catalog.Modules.Where(m => m.Definition is null))
             Warn($"{m.Type} {Sql.Quote(m.Schema, m.Name)} is encrypted and was not cloned.");
 
-        await using (var master = await OpenAsync(masterConnectionString, "target", ct))
-        {
-            await EnsureNotSameDatabaseAsync(source, master, sourceDatabase, ct);
-            await CreateTargetDatabaseAsync(master, catalog, ct);
-        }
+        await PrepareTargetDatabaseAsync(source, sourceDatabase, masterConnectionString, targetConnectionString, catalog,
+            Warn, ct);
 
         // SMO reads the source schema over its own connection so it can't interfere with ours.
         var smoConnection = new ServerConnection(new SqlConnection(options.SourceConnectionString));
@@ -82,32 +79,135 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
         }
     }
 
-    private async Task EnsureNotSameDatabaseAsync(SqlConnection source, SqlConnection master, string sourceDatabase,
+    /// <summary>
+    /// Creates the target database, or fills an existing one that's empty. An existing database that isn't empty is
+    /// only replaced with --force.
+    /// </summary>
+    private async Task PrepareTargetDatabaseAsync(SqlConnection source, string sourceDatabase,
+        string masterConnectionString, string targetConnectionString, SourceCatalog catalog, Action<string> warn,
+        CancellationToken ct)
+    {
+        var name = Sql.Quote(options.TargetDatabase);
+
+        // A login confined to one database (a contained user on Azure SQL, say) can't reach master. Then the database
+        // is assumed to exist, and connecting to it tells.
+        var (master, masterError) = await TryOpenAsync(masterConnectionString, ct);
+        await using (master)
+        {
+            var exists = master is null ||
+                         await ScalarAsync<object>(master, $"SELECT DB_ID({Sql.Literal(options.TargetDatabase)})", ct) is not DBNull;
+            if (exists)
+            {
+                var (target, targetError) = await TryOpenAsync(targetConnectionString, ct);
+                if (target is null)
+                    throw master is null
+                        ? new CloneException($"Could not connect to the target server's master database ({masterError!.Message}) or to database {name} ({targetError!.Message}).", targetError)
+                        : new CloneException($"Database {name} already exists on the target server but could not be opened: {targetError!.Message}", targetError);
+
+                await using (target)
+                {
+                    await EnsureNotSameDatabaseAsync(source, target, sourceDatabase, ct);
+
+                    var contents = await ListContentsAsync(target, ct);
+                    if (contents.Count == 0)
+                    {
+                        log.Info($"Using existing empty database {name}...");
+                        await MatchSourceSettingsAsync(target, catalog, warn, ct);
+                        // Changing the collation leaves this session unusable, so it must not go back into the pool.
+                        SqlConnection.ClearPool(target);
+                        return;
+                    }
+
+                    if (!options.Force)
+                        throw new CloneException($"Database {name} already exists on the target server and isn't empty ({string.Join(", ", contents)}). Use --force to replace it.");
+                    if (master is null)
+                        throw new CloneException($"Database {name} isn't empty, and replacing it needs the target server's master database: {masterError!.Message}", masterError);
+                }
+
+                log.Info($"Dropping existing database {name}...");
+                await ExecuteAsync(master, $"ALTER DATABASE {name} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {name};", ct);
+                SqlConnection.ClearAllPools();
+            }
+
+            await CreateTargetDatabaseAsync(master!, catalog, ct);
+        }
+    }
+
+    private async Task EnsureNotSameDatabaseAsync(SqlConnection source, SqlConnection target, string sourceDatabase,
         CancellationToken ct)
     {
         if (!string.Equals(sourceDatabase, options.TargetDatabase, StringComparison.OrdinalIgnoreCase)) return;
 
-        // tempdb is recreated whenever an instance starts, so its create_date tells two instances apart.
+        // The server name and creation time tell apart two databases with the same name.
         // Plain + rather than CONCAT, which a source older than SQL Server 2012 doesn't have.
-        const string instanceId = "SELECT ISNULL(@@SERVERNAME, '') + '|' + CONVERT(nvarchar(30), create_date, 126) FROM sys.databases WHERE name = 'tempdb'";
-        if (await ScalarAsync<string>(source, instanceId, ct) == await ScalarAsync<string>(master, instanceId, ct))
+        const string databaseId = "SELECT ISNULL(@@SERVERNAME, '') + '|' + CONVERT(nvarchar(30), create_date, 126) FROM sys.databases WHERE database_id = DB_ID()";
+        if (await ScalarAsync<string>(source, databaseId, ct) == await ScalarAsync<string>(target, databaseId, ct))
             throw new CloneException("The target database is the source database.");
+    }
+
+    /// <summary>Up to five of the things the clone would create that the database already has.</summary>
+    private static async Task<List<string>> ListContentsAsync(SqlConnection target, CancellationToken ct)
+    {
+        // Constraints and triggers on a table belong to it, and a table type's hidden TT_ object to the type. User
+        // schemas have ids from 5 (after dbo, guest, INFORMATION_SCHEMA and sys) to 16383 (before the role schemas).
+        const string sql = """
+            SELECT TOP (5) item FROM (
+                SELECT 'object ' + QUOTENAME(SCHEMA_NAME(schema_id)) + '.' + QUOTENAME(name) AS item FROM sys.objects
+                    WHERE is_ms_shipped = 0 AND parent_object_id = 0 AND type <> 'TT'
+                UNION ALL SELECT 'schema ' + QUOTENAME(name) FROM sys.schemas WHERE schema_id BETWEEN 5 AND 16383
+                UNION ALL SELECT 'type ' + QUOTENAME(SCHEMA_NAME(schema_id)) + '.' + QUOTENAME(name) FROM sys.types
+                    WHERE is_user_defined = 1
+                UNION ALL SELECT 'xml schema collection ' + QUOTENAME(SCHEMA_NAME(schema_id)) + '.' + QUOTENAME(name)
+                    FROM sys.xml_schema_collections WHERE schema_id <> SCHEMA_ID('sys')
+                UNION ALL SELECT 'database trigger ' + QUOTENAME(name) FROM sys.triggers WHERE parent_class = 0
+            ) AS contents ORDER BY item
+            """;
+        await using var cmd = new SqlCommand(sql, target) { CommandTimeout = 0 };
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        var contents = new List<string>();
+        while (await reader.ReadAsync(ct)) contents.Add(reader.GetString(0));
+        return contents;
+    }
+
+    /// <summary>
+    /// Gives an existing database the source's collation and compatibility level, as a new one would get. A login
+    /// that may not alter the database leaves them as they were, with a warning.
+    /// </summary>
+    private async Task MatchSourceSettingsAsync(SqlConnection target, SourceCatalog catalog, Action<string> warn,
+        CancellationToken ct)
+    {
+        var name = Sql.Quote(options.TargetDatabase);
+
+        var collation = await ScalarAsync<string>(target, "SELECT CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation'))", ct);
+        if (!string.Equals(collation, catalog.Collation, StringComparison.OrdinalIgnoreCase))
+        {
+            // Needs the database to itself, which it has when nothing else is connected: this session can stay in it.
+            log.Info($"Changing the collation of {name} from {collation} to {catalog.Collation}...");
+            await TryAsync($"ALTER DATABASE {name} COLLATE {catalog.Collation}",
+                $"Could not change the collation of {name} from {collation} to {catalog.Collation}");
+        }
+
+        var level = await ScalarAsync<int>(target, "SELECT CAST(compatibility_level AS int) FROM sys.databases WHERE database_id = DB_ID()", ct);
+        if (level != catalog.CompatibilityLevel)
+            await TryAsync($"ALTER DATABASE {name} SET COMPATIBILITY_LEVEL = {catalog.CompatibilityLevel}",
+                $"Could not change the compatibility level of {name} from {level} to {catalog.CompatibilityLevel}");
+
+        async Task TryAsync(string sql, string failure)
+        {
+            try
+            {
+                await ExecuteAsync(target, sql, ct);
+            }
+            catch (SqlException ex)
+            {
+                warn($"{failure}: {ex.Message}");
+            }
+        }
     }
 
     private async Task CreateTargetDatabaseAsync(SqlConnection master, SourceCatalog catalog, CancellationToken ct)
     {
         var name = Sql.Quote(options.TargetDatabase);
-        var exists = await ScalarAsync<object>(master, $"SELECT DB_ID({Sql.Literal(options.TargetDatabase)})", ct) is not DBNull;
-        if (exists)
-        {
-            if (!options.Force)
-                throw new CloneException($"Database {name} already exists on the target server. Use --force to replace it.");
-
-            log.Info($"Dropping existing database {name}...");
-            await ExecuteAsync(master, $"ALTER DATABASE {name} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {name};", ct);
-            SqlConnection.ClearAllPools();
-        }
-
         log.Info($"Creating database {name}...");
         await ExecuteAsync(master, $"CREATE DATABASE {name} COLLATE {catalog.Collation}", ct);
 
@@ -193,6 +293,22 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
         {
             await connection.DisposeAsync();
             throw new CloneException($"Could not connect to the {role}: {ex.Message}", ex);
+        }
+    }
+
+    private static async Task<(SqlConnection? Connection, SqlException? Error)> TryOpenAsync(string connectionString,
+        CancellationToken ct)
+    {
+        var connection = new SqlConnection(connectionString);
+        try
+        {
+            await connection.OpenAsync(ct);
+            return (connection, null);
+        }
+        catch (SqlException ex)
+        {
+            await connection.DisposeAsync();
+            return (null, ex);
         }
     }
 
