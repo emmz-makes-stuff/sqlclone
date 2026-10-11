@@ -65,7 +65,10 @@ internal sealed class SchemaScripter(Database database, SourceCatalog catalog)
     {
         var units = new List<ScriptUnit>();
 
-        units.AddRange(catalog.Schemas.Select(s => new ScriptUnit($"schema {Sql.Quote(s)}", [$"CREATE SCHEMA {Sql.Quote(s)}"])));
+        // Owned by dbo whoever runs the clone: users aren't cloned, and a schema would otherwise belong to the login
+        // doing it whenever that isn't dbo (a contained user filling an existing database, say).
+        units.AddRange(catalog.Schemas.Select(s => new ScriptUnit($"schema {Sql.Quote(s)}",
+            [$"CREATE SCHEMA {Sql.Quote(s)} AUTHORIZATION [dbo]"])));
 
         foreach (XmlSchemaCollection x in database.XmlSchemaCollections)
             if (x.Schema != "sys")

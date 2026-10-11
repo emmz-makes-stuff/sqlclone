@@ -66,7 +66,7 @@ public sealed class SqlServerFixture : IAsyncLifetime
         await new DataSeeder(SourceDatabase(database), seed: database.Length).SeedAsync(minRows: 5, maxRows: 30, ct);
     }
 
-    private static async Task ExecuteAsync(string connectionString, string sql, CancellationToken ct)
+    public static async Task ExecuteAsync(string connectionString, string sql, CancellationToken ct)
     {
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(ct);

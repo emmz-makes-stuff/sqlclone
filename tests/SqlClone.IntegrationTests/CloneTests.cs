@@ -29,11 +29,65 @@ public sealed class CloneTests(SqlServerFixture fixture)
         if (source.RowCounts.TryGetValue("[dbo].[CUS_ENTITY_DATA]", out var wideRows))
             Assert.True(wideRows > 0, "The wide table CUS_ENTITY_DATA was not seeded.");
 
-        var differences = source.Categories.Keys
-            .Select(category => Describe(category, source.Categories[category], clone.Categories[category]))
-            .Where(d => d is not null)
-            .ToList();
-        Assert.True(differences.Count == 0, string.Join("\n\n", differences));
+        AssertSame(source, clone);
+    }
+
+    [Fact]
+    public async Task Clones_into_an_existing_empty_database_and_gives_it_the_source_settings()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        const string cloneName = "Existing_Clone";
+        var sourceDatabase = fixture.SourceDatabase(SqlServerFixture.CustomEntitiesDatabase);
+        await SqlServerFixture.ExecuteAsync(fixture.TargetServer,
+            $"CREATE DATABASE [{cloneName}] COLLATE Latin1_General_100_CS_AS; ALTER DATABASE [{cloneName}] SET COMPATIBILITY_LEVEL = 130;", ct);
+
+        var (exitCode, output) = await RunAsync("-s", sourceDatabase, "-t", fixture.TargetServer, "-n", cloneName);
+        Assert.True(exitCode == Cli.Success, $"sqlclone exited with {exitCode}:\n{output}");
+        Assert.Contains("Using existing empty database", output);
+
+        Assert.Equal(await SettingsAsync(sourceDatabase, ct), await SettingsAsync(fixture.TargetDatabase(cloneName), ct));
+        AssertSame(await DatabaseSnapshot.CaptureAsync(sourceDatabase, ct),
+            await DatabaseSnapshot.CaptureAsync(fixture.TargetDatabase(cloneName), ct));
+    }
+
+    [Fact]
+    public async Task Clones_into_an_existing_database_as_a_user_who_cannot_reach_master()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        const string cloneName = "Contained_Clone";
+        const string password = "C0nt@ined-Us3r";
+        var sourceDatabase = fixture.SourceDatabase(SqlServerFixture.CustomEntitiesDatabase);
+        await SqlServerFixture.ExecuteAsync(fixture.TargetServer,
+            $"EXEC sp_configure 'contained database authentication', 1; RECONFIGURE; CREATE DATABASE [{cloneName}] CONTAINMENT = PARTIAL;", ct);
+        await SqlServerFixture.ExecuteAsync(fixture.TargetDatabase(cloneName),
+            $"CREATE USER cloner WITH PASSWORD = '{password}'; ALTER ROLE db_owner ADD MEMBER cloner;", ct);
+
+        var contained = new SqlConnectionStringBuilder(fixture.TargetServer) { UserID = "cloner", Password = password }.ConnectionString;
+        var (exitCode, output) = await RunAsync("-s", sourceDatabase, "-t", contained, "-n", cloneName);
+        Assert.True(exitCode == Cli.Success, $"sqlclone exited with {exitCode}:\n{output}");
+
+        // Dropping the user also proves it owns nothing it created. A contained database's metadata has its own collation, which the snapshot queries can't mix with the
+        // database's, so it goes back to an ordinary database before it is compared.
+        await SqlServerFixture.ExecuteAsync(fixture.TargetDatabase(cloneName), "DROP USER cloner", ct);
+        SqlConnection.ClearAllPools();
+        await SqlServerFixture.ExecuteAsync(fixture.TargetServer,
+            $"ALTER DATABASE [{cloneName}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; ALTER DATABASE [{cloneName}] SET CONTAINMENT = NONE; ALTER DATABASE [{cloneName}] SET MULTI_USER;", ct);
+        AssertSame(await DatabaseSnapshot.CaptureAsync(sourceDatabase, ct),
+            await DatabaseSnapshot.CaptureAsync(fixture.TargetDatabase(cloneName), ct));
+    }
+
+    [Fact]
+    public async Task Refuses_an_existing_database_that_is_not_empty_and_says_what_is_in_it()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        const string cloneName = "Occupied_Clone";
+        await SqlServerFixture.ExecuteAsync(fixture.TargetServer, $"CREATE DATABASE [{cloneName}]", ct);
+        await SqlServerFixture.ExecuteAsync(fixture.TargetDatabase(cloneName), "CREATE TABLE dbo.MARKER (ID int)", ct);
+
+        var (exitCode, output) = await RunAsync("-s", fixture.SourceDatabase(SqlServerFixture.CustomEntitiesDatabase),
+            "-t", fixture.TargetServer, "-n", cloneName);
+        Assert.Equal(Cli.Failed, exitCode);
+        Assert.Contains("isn't empty (object [dbo].[MARKER])", output);
     }
 
     [Fact]
@@ -79,6 +133,27 @@ public sealed class CloneTests(SqlServerFixture fixture)
         var exitCode = await Cli.RunAsync(args, output, output, TestContext.Current.CancellationToken);
         TestContext.Current.TestOutputHelper?.WriteLine(output.ToString());
         return (exitCode, output.ToString());
+    }
+
+    private static async Task<(string Collation, int CompatibilityLevel)> SettingsAsync(string connectionString,
+        CancellationToken ct)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(ct);
+        await using var cmd = new SqlCommand(
+            "SELECT collation_name, CAST(compatibility_level AS int) FROM sys.databases WHERE database_id = DB_ID()", connection);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        await reader.ReadAsync(ct);
+        return (reader.GetString(0), reader.GetInt32(1));
+    }
+
+    private static void AssertSame(DatabaseSnapshot source, DatabaseSnapshot clone)
+    {
+        var differences = source.Categories.Keys
+            .Select(category => Describe(category, source.Categories[category], clone.Categories[category]))
+            .Where(d => d is not null)
+            .ToList();
+        Assert.True(differences.Count == 0, string.Join("\n\n", differences));
     }
 
     private static string? Describe(string category, IReadOnlyList<string> source, IReadOnlyList<string> clone)
