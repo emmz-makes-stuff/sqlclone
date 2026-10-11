@@ -119,6 +119,132 @@ public sealed class CloneTests(SqlServerFixture fixture)
     }
 
     [Fact]
+    public async Task Use_existing_clones_alongside_what_the_database_already_has()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        const string cloneName = "UseExisting_Clone";
+        var sourceDatabase = fixture.SourceDatabase(SqlServerFixture.CustomEntitiesDatabase);
+        await SqlServerFixture.ExecuteAsync(fixture.TargetServer, $"CREATE DATABASE [{cloneName}]", ct);
+        await SqlServerFixture.ExecuteAsync(fixture.TargetDatabase(cloneName),
+            "CREATE TABLE dbo.DUMMY (ID int); INSERT dbo.DUMMY VALUES (42);", ct);
+
+        var (exitCode, output) = await RunAsync("-s", sourceDatabase, "-t", fixture.TargetServer, "-n", cloneName, "--use-existing");
+        Assert.True(exitCode == Cli.Success, $"sqlclone exited with {exitCode}:\n{output}");
+        Assert.Contains("Using existing database", output);
+
+        await using (var connection = new SqlConnection(fixture.TargetDatabase(cloneName)))
+        {
+            await connection.OpenAsync(ct);
+            await using var cmd = new SqlCommand("SELECT ID FROM dbo.DUMMY", connection);
+            Assert.Equal(42, await cmd.ExecuteScalarAsync(ct));
+        }
+
+        // With the table that was already there gone, the database is the clone and nothing else.
+        await SqlServerFixture.ExecuteAsync(fixture.TargetDatabase(cloneName), "DROP TABLE dbo.DUMMY", ct);
+        AssertSame(await DatabaseSnapshot.CaptureAsync(sourceDatabase, ct),
+            await DatabaseSnapshot.CaptureAsync(fixture.TargetDatabase(cloneName), ct));
+    }
+
+    [Fact]
+    public async Task Use_existing_refuses_a_name_the_clone_would_give_and_writes_nothing()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        const string cloneName = "UseExisting_Clash";
+        await SqlServerFixture.ExecuteAsync(fixture.TargetServer, $"CREATE DATABASE [{cloneName}]", ct);
+        await SqlServerFixture.ExecuteAsync(fixture.TargetDatabase(cloneName), "CREATE TABLE dbo.CUS_ENTITY_DATA (ID int)", ct);
+
+        var (exitCode, output) = await RunAsync("-s", fixture.SourceDatabase(SqlServerFixture.CustomEntitiesDatabase),
+            "-t", fixture.TargetServer, "-n", cloneName, "--use-existing");
+        Assert.Equal(Cli.Failed, exitCode);
+        Assert.Contains("object [dbo].[CUS_ENTITY_DATA]", output);
+
+        await using var connection = new SqlConnection(fixture.TargetDatabase(cloneName));
+        await connection.OpenAsync(ct);
+        await using var cmd = new SqlCommand("SELECT COUNT(*) FROM sys.objects WHERE is_ms_shipped = 0", connection);
+        Assert.Equal(1, await cmd.ExecuteScalarAsync(ct));
+    }
+
+    [Fact]
+    public async Task Use_existing_leaves_the_database_settings_alone_and_warns()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        const string cloneName = "UseExisting_Settings";
+        await SqlServerFixture.ExecuteAsync(fixture.TargetServer,
+            $"CREATE DATABASE [{cloneName}] COLLATE Latin1_General_100_CS_AS; ALTER DATABASE [{cloneName}] SET COMPATIBILITY_LEVEL = 130;", ct);
+        await SqlServerFixture.ExecuteAsync(fixture.TargetDatabase(cloneName), "CREATE TABLE dbo.DUMMY (ID int)", ct);
+
+        var (exitCode, output) = await RunAsync("-s", fixture.SourceDatabase(SqlServerFixture.CustomEntitiesDatabase),
+            "-t", fixture.TargetServer, "-n", cloneName, "--use-existing", "--dry-run");
+        Assert.True(exitCode == Cli.Success, $"sqlclone exited with {exitCode}:\n{output}");
+        Assert.Contains("Did not change the collation", output);
+        Assert.Contains("Did not change the compatibility level", output);
+        Assert.Equal(("Latin1_General_100_CS_AS", 130), await SettingsAsync(fixture.TargetDatabase(cloneName), ct));
+    }
+
+    [Fact]
+    public async Task Use_existing_needs_the_database_to_exist()
+    {
+        var (exitCode, output) = await RunAsync("-s", fixture.SourceDatabase(SqlServerFixture.CustomEntitiesDatabase),
+            "-t", fixture.TargetServer, "-n", "UseExisting_Missing", "--use-existing");
+        Assert.Equal(Cli.Failed, exitCode);
+        Assert.Contains("doesn't exist", output);
+    }
+
+    [Fact]
+    public async Task Use_existing_and_force_cannot_be_used_together()
+    {
+        var (exitCode, output) = await RunAsync("-s", fixture.SourceDatabase(SqlServerFixture.CustomEntitiesDatabase),
+            "-t", fixture.TargetServer, "-n", "UseExisting_Force", "--use-existing", "--force");
+        Assert.Equal(Cli.Failed, exitCode);
+        Assert.Contains("can't be used together", output);
+    }
+
+    [Fact]
+    public async Task Dry_run_reports_the_plan_and_creates_nothing()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        const string cloneName = "DryRun_Clone";
+
+        var (exitCode, output) = await RunAsync("-s", fixture.SourceDatabase(SqlServerFixture.CustomEntitiesDatabase),
+            "-t", fixture.TargetServer, "-n", cloneName, "--dry-run");
+        Assert.True(exitCode == Cli.Success, $"sqlclone exited with {exitCode}:\n{output}");
+        Assert.Contains($"Would create database [{cloneName}]", output);
+        Assert.Matches(@"Would create [1-9]\d* schema objects", output);
+        Assert.Matches(@"Would copy [1-9]\d* tables", output);
+        Assert.Contains("[dbo].[CUS_ENTITY_DATA]", output);
+        Assert.Matches(@"Total: [1-9][\d,]* rows", output);
+
+        await using var connection = new SqlConnection(fixture.TargetServer);
+        await connection.OpenAsync(ct);
+        await using var cmd = new SqlCommand($"SELECT DB_ID('{cloneName}')", connection);
+        Assert.IsType<DBNull>(await cmd.ExecuteScalarAsync(ct));
+    }
+
+    [Fact]
+    public async Task Dry_run_refuses_a_database_that_is_not_empty_unless_forced_and_leaves_it_alone()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        const string cloneName = "DryRun_Occupied";
+        await SqlServerFixture.ExecuteAsync(fixture.TargetServer, $"CREATE DATABASE [{cloneName}]", ct);
+        await SqlServerFixture.ExecuteAsync(fixture.TargetDatabase(cloneName), "CREATE TABLE dbo.MARKER (ID int)", ct);
+        string[] args = ["-s", fixture.SourceDatabase(SqlServerFixture.CustomEntitiesDatabase), "-t", fixture.TargetServer,
+            "-n", cloneName, "--dry-run"];
+
+        var (exitCode, output) = await RunAsync(args);
+        Assert.Equal(Cli.Failed, exitCode);
+        Assert.Contains("isn't empty (object [dbo].[MARKER])", output);
+
+        (exitCode, output) = await RunAsync([.. args, "--force"]);
+        Assert.True(exitCode == Cli.Success, $"sqlclone exited with {exitCode}:\n{output}");
+        Assert.Contains($"Would drop existing database [{cloneName}]", output);
+
+        await using var connection = new SqlConnection(fixture.TargetDatabase(cloneName));
+        await connection.OpenAsync(ct);
+        await using var cmd = new SqlCommand("SELECT OBJECT_ID('dbo.MARKER')", connection);
+        Assert.IsType<int>(await cmd.ExecuteScalarAsync(ct));
+    }
+
+    [Fact]
     public async Task Requires_a_source_database_name()
     {
         var sourceServer = new SqlConnectionStringBuilder(fixture.SourceDatabase("x")) { InitialCatalog = "" }.ConnectionString;

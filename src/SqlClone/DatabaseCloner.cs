@@ -20,11 +20,15 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
             throw new CloneException("The source connection string must specify a database (Initial Catalog / Database).");
         if (string.IsNullOrWhiteSpace(options.TargetDatabase))
             throw new CloneException("The target database name must not be empty.");
+        if (options.Force && options.UseExisting)
+            throw new CloneException("--force and --use-existing can't be used together: one drops the target database, the other keeps what's in it.");
 
         var masterConnectionString = new SqlConnectionStringBuilder(options.TargetConnectionString)
             { InitialCatalog = "master" }.ConnectionString;
         var targetConnectionString = new SqlConnectionStringBuilder(options.TargetConnectionString)
             { InitialCatalog = options.TargetDatabase }.ConnectionString;
+
+        if (options.DryRun) log.Info("Dry run: nothing will be written.");
 
         await using var source = await OpenAsync(options.SourceConnectionString, "source", ct);
         log.Info($"Reading [{sourceDatabase}] catalog...");
@@ -42,6 +46,12 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
         try
         {
             var scripter = new SchemaScripter(new Server(smoConnection).Databases[sourceDatabase], catalog);
+
+            if (options.DryRun)
+            {
+                await ReportPlanAsync(source, scripter, catalog, ct);
+                return new CloneResult(sourceDatabase, errors, warnings, stopwatch.Elapsed);
+            }
 
             await using var target = await OpenAsync(targetConnectionString, "target", ct);
 
@@ -81,7 +91,7 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
 
     /// <summary>
     /// Creates the target database, or fills an existing one that's empty. An existing database that isn't empty is
-    /// only replaced with --force.
+    /// only replaced with --force, or filled alongside what it has with --use-existing.
     /// </summary>
     private async Task PrepareTargetDatabaseAsync(SqlConnection source, string sourceDatabase,
         string masterConnectionString, string targetConnectionString, SourceCatalog catalog, Action<string> warn,
@@ -108,10 +118,22 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
                 {
                     await EnsureNotSameDatabaseAsync(source, target, sourceDatabase, ct);
 
+                    if (options.UseExisting)
+                    {
+                        await EnsureNoClashesAsync(source, target, ct);
+                        log.Info(options.DryRun
+                            ? $"Would use existing database {name}, leaving what is already in it."
+                            : $"Using existing database {name}, leaving what is already in it...");
+                        await MatchSourceSettingsAsync(target, catalog, warn, ct);
+                        return;
+                    }
+
                     var contents = await ListContentsAsync(target, ct);
                     if (contents.Count == 0)
                     {
-                        log.Info($"Using existing empty database {name}...");
+                        log.Info(options.DryRun
+                            ? $"Would use existing empty database {name}."
+                            : $"Using existing empty database {name}...");
                         await MatchSourceSettingsAsync(target, catalog, warn, ct);
                         // Changing the collation leaves this session unusable, so it must not go back into the pool.
                         SqlConnection.ClearPool(target);
@@ -124,9 +146,20 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
                         throw new CloneException($"Database {name} isn't empty, and replacing it needs the target server's master database: {masterError!.Message}", masterError);
                 }
 
-                log.Info($"Dropping existing database {name}...");
-                await ExecuteAsync(master, $"ALTER DATABASE {name} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {name};", ct);
-                SqlConnection.ClearAllPools();
+                if (options.DryRun)
+                {
+                    log.Info($"Would drop existing database {name}.");
+                }
+                else
+                {
+                    log.Info($"Dropping existing database {name}...");
+                    await ExecuteAsync(master, $"ALTER DATABASE {name} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {name};", ct);
+                    SqlConnection.ClearAllPools();
+                }
+            }
+            else if (options.UseExisting)
+            {
+                throw new CloneException($"Database {name} doesn't exist on the target server, and --use-existing needs it to.");
             }
 
             await CreateTargetDatabaseAsync(master!, catalog, ct);
@@ -145,33 +178,49 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
             throw new CloneException("The target database is the source database.");
     }
 
+    /// <summary>
+    /// The named things in a database that the clone creates, each as the kind of name it is and the name, so that
+    /// two that would clash read the same. Constraints and triggers on a table are left out unless asked for: the
+    /// table says the database isn't empty, but their names still clash, since every object in a schema shares one
+    /// namespace. A table type's hidden TT_ object belongs to the type. User schemas have ids from 5 (after dbo, guest,
+    /// INFORMATION_SCHEMA and sys) to 16383 (before the role schemas).
+    /// </summary>
+    private static string ContentsQuery(bool childObjects) => $"""
+        SELECT 'object ' + QUOTENAME(SCHEMA_NAME(schema_id)) + '.' + QUOTENAME(name) AS item FROM sys.objects
+            WHERE is_ms_shipped = 0 AND type <> 'TT' {(childObjects ? "" : "AND parent_object_id = 0")}
+        UNION ALL SELECT 'schema ' + QUOTENAME(name) FROM sys.schemas WHERE schema_id BETWEEN 5 AND 16383
+        UNION ALL SELECT 'type ' + QUOTENAME(SCHEMA_NAME(schema_id)) + '.' + QUOTENAME(name) FROM sys.types
+            WHERE is_user_defined = 1
+        UNION ALL SELECT 'xml schema collection ' + QUOTENAME(SCHEMA_NAME(schema_id)) + '.' + QUOTENAME(name)
+            FROM sys.xml_schema_collections WHERE schema_id <> SCHEMA_ID('sys')
+        UNION ALL SELECT 'database trigger ' + QUOTENAME(name) FROM sys.triggers WHERE parent_class = 0
+        """;
+
     /// <summary>Up to five of the things the clone would create that the database already has.</summary>
-    private static async Task<List<string>> ListContentsAsync(SqlConnection target, CancellationToken ct)
+    private static Task<IReadOnlyList<string>> ListContentsAsync(SqlConnection target, CancellationToken ct) =>
+        SourceCatalog.ListAsync(target, $"SELECT TOP (5) item FROM ({ContentsQuery(childObjects: false)}) AS contents ORDER BY item",
+            r => r.GetString(0), ct);
+
+    /// <summary>
+    /// Stops a --use-existing clone before it writes anything if the database already has something with a name the
+    /// clone would give.
+    /// </summary>
+    private async Task EnsureNoClashesAsync(SqlConnection source, SqlConnection target, CancellationToken ct)
     {
-        // Constraints and triggers on a table belong to it, and a table type's hidden TT_ object to the type. User
-        // schemas have ids from 5 (after dbo, guest, INFORMATION_SCHEMA and sys) to 16383 (before the role schemas).
-        const string sql = """
-            SELECT TOP (5) item FROM (
-                SELECT 'object ' + QUOTENAME(SCHEMA_NAME(schema_id)) + '.' + QUOTENAME(name) AS item FROM sys.objects
-                    WHERE is_ms_shipped = 0 AND parent_object_id = 0 AND type <> 'TT'
-                UNION ALL SELECT 'schema ' + QUOTENAME(name) FROM sys.schemas WHERE schema_id BETWEEN 5 AND 16383
-                UNION ALL SELECT 'type ' + QUOTENAME(SCHEMA_NAME(schema_id)) + '.' + QUOTENAME(name) FROM sys.types
-                    WHERE is_user_defined = 1
-                UNION ALL SELECT 'xml schema collection ' + QUOTENAME(SCHEMA_NAME(schema_id)) + '.' + QUOTENAME(name)
-                    FROM sys.xml_schema_collections WHERE schema_id <> SCHEMA_ID('sys')
-                UNION ALL SELECT 'database trigger ' + QUOTENAME(name) FROM sys.triggers WHERE parent_class = 0
-            ) AS contents ORDER BY item
-            """;
-        await using var cmd = new SqlCommand(sql, target) { CommandTimeout = 0 };
-        await using var reader = await cmd.ExecuteReaderAsync(ct);
-        var contents = new List<string>();
-        while (await reader.ReadAsync(ct)) contents.Add(reader.GetString(0));
-        return contents;
+        var query = ContentsQuery(childObjects: true);
+        // Ignoring case may find a clash that a case-sensitive target wouldn't have, but never misses one.
+        var existing = (await SourceCatalog.ListAsync(target, query, r => r.GetString(0), ct))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var clashes = (await SourceCatalog.ListAsync(source, query, r => r.GetString(0), ct))
+            .Where(existing.Contains).Order(StringComparer.OrdinalIgnoreCase).ToList();
+        if (clashes.Count > 0)
+            throw new CloneException($"Database {Sql.Quote(options.TargetDatabase)} already has {clashes.Count} thing(s) with the same name as something the clone would create: {string.Join(", ", clashes.Take(10))}{(clashes.Count > 10 ? ", ..." : "")}");
     }
 
     /// <summary>
     /// Gives an existing database the source's collation and compatibility level, as a new one would get. A login
-    /// that may not alter the database leaves them as they were, with a warning.
+    /// that may not alter the database leaves them as they were, with a warning; so does --use-existing, which never
+    /// alters the database itself.
     /// </summary>
     private async Task MatchSourceSettingsAsync(SqlConnection target, SourceCatalog catalog, Action<string> warn,
         CancellationToken ct)
@@ -182,25 +231,38 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
         if (!string.Equals(collation, catalog.Collation, StringComparison.OrdinalIgnoreCase))
         {
             // Needs the database to itself, which it has when nothing else is connected: this session can stay in it.
-            log.Info($"Changing the collation of {name} from {collation} to {catalog.Collation}...");
+            if (!options.DryRun && !options.UseExisting) log.Info($"Changing the collation of {name} from {collation} to {catalog.Collation}...");
             await TryAsync($"ALTER DATABASE {name} COLLATE {catalog.Collation}",
-                $"Could not change the collation of {name} from {collation} to {catalog.Collation}");
+                $"change the collation of {name} from {collation} to {catalog.Collation}");
         }
 
         var level = await ScalarAsync<int>(target, "SELECT CAST(compatibility_level AS int) FROM sys.databases WHERE database_id = DB_ID()", ct);
         if (level != catalog.CompatibilityLevel)
             await TryAsync($"ALTER DATABASE {name} SET COMPATIBILITY_LEVEL = {catalog.CompatibilityLevel}",
-                $"Could not change the compatibility level of {name} from {level} to {catalog.CompatibilityLevel}");
+                $"change the compatibility level of {name} from {level} to {catalog.CompatibilityLevel}");
 
-        async Task TryAsync(string sql, string failure)
+        // A dry run can't tell whether the login would be allowed to make the change.
+        async Task TryAsync(string sql, string change)
         {
+            if (options.UseExisting)
+            {
+                warn($"Did not {change}: --use-existing leaves the database's settings as they are.");
+                return;
+            }
+
+            if (options.DryRun)
+            {
+                log.Info($"Would {change}.");
+                return;
+            }
+
             try
             {
                 await ExecuteAsync(target, sql, ct);
             }
             catch (SqlException ex)
             {
-                warn($"{failure}: {ex.Message}");
+                warn($"Could not {change}: {ex.Message}");
             }
         }
     }
@@ -208,13 +270,40 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
     private async Task CreateTargetDatabaseAsync(SqlConnection master, SourceCatalog catalog, CancellationToken ct)
     {
         var name = Sql.Quote(options.TargetDatabase);
-        log.Info($"Creating database {name}...");
-        await ExecuteAsync(master, $"CREATE DATABASE {name} COLLATE {catalog.Collation}", ct);
-
         var maxLevel = await ScalarAsync<int>(master,
             "SELECT CAST(compatibility_level AS int) FROM sys.databases WHERE name = 'master'", ct);
-        if (catalog.CompatibilityLevel <= maxLevel)
+        var setLevel = catalog.CompatibilityLevel <= maxLevel;
+
+        if (options.DryRun)
+        {
+            log.Info($"Would create database {name} with collation {catalog.Collation} and " +
+                     (setLevel ? $"compatibility level {catalog.CompatibilityLevel}." : "the server's default compatibility level."));
+            return;
+        }
+
+        log.Info($"Creating database {name}...");
+        await ExecuteAsync(master, $"CREATE DATABASE {name} COLLATE {catalog.Collation}", ct);
+        if (setLevel)
             await ExecuteAsync(master, $"ALTER DATABASE {name} SET COMPATIBILITY_LEVEL = {catalog.CompatibilityLevel}", ct);
+    }
+
+    /// <summary>Says what the clone would create and copy, from the scripts it would run and the source's row counts.</summary>
+    private async Task ReportPlanAsync(SqlConnection source, SchemaScripter scripter, SourceCatalog catalog,
+        CancellationToken ct)
+    {
+        log.Info("Scripting schema...");
+        var preData = scripter.PreData().Count;
+        var postData = scripter.PostData().Count;
+        log.Info($"Would create {preData} schema objects, then {postData} indexes, constraints and triggers.");
+        log.Info($"Would restore {catalog.Identities.Count(i => i.LastValue is not null)} identities and " +
+                 $"{catalog.Sequences.Count} sequences, and copy {catalog.ExtendedProperties.Count} extended properties.");
+
+        var rows = await SourceCatalog.ReadRowCountsAsync(source, ct);
+        var width = catalog.Tables.Select(t => t.QualifiedName.Length).DefaultIfEmpty(0).Max();
+        log.Info($"Would copy {catalog.Tables.Count} tables:");
+        foreach (var t in catalog.Tables)
+            log.Info($"  {t.QualifiedName.PadRight(width)} {rows.GetValueOrDefault(t.ObjectId),15:N0} rows");
+        log.Info($"Total: {catalog.Tables.Sum(t => rows.GetValueOrDefault(t.ObjectId)):N0} rows.");
     }
 
     private static async Task RestoreIdentitiesAsync(SqlConnection target, SourceCatalog catalog,

@@ -5,7 +5,9 @@ public sealed record CloneOptions(
     string TargetConnectionString,
     string TargetDatabase,
     bool Force = false,
-    int Parallelism = 4);
+    int Parallelism = 4,
+    bool DryRun = false,
+    bool UseExisting = false);
 
 public sealed record CloneResult(
     string SourceDatabase,

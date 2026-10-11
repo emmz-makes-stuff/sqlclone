@@ -191,6 +191,19 @@ internal sealed class SourceCatalog
         return columns;
     }
 
+    /// <summary>
+    /// Rows per table by object id, from the counts SQL Server keeps in sys.partitions rather than a scan of each
+    /// table, so they can lag a transaction in flight.
+    /// </summary>
+    public static async Task<IReadOnlyDictionary<int, long>> ReadRowCountsAsync(SqlConnection connection,
+        CancellationToken ct)
+    {
+        var counts = await ListAsync(connection,
+            "SELECT object_id, SUM(rows) FROM sys.partitions WHERE index_id IN (0, 1) GROUP BY object_id",
+            r => (Id: r.GetInt32(0), Rows: r.GetInt64(1)), ct);
+        return counts.ToDictionary(c => c.Id, c => c.Rows);
+    }
+
     private static async Task<IReadOnlyList<Binding>> ReadBindingsAsync(SqlConnection connection, CancellationToken ct)
     {
         // Legacy CREATE RULE / CREATE DEFAULT objects bound to types and columns (parent_object_id = 0 means the

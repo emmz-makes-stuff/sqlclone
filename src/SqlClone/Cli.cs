@@ -38,10 +38,18 @@ public static class Cli
             Description = "Number of tables to copy concurrently.",
             DefaultValueFactory = _ => 4,
         };
+        var useExisting = new Option<bool>("--use-existing")
+        {
+            Description = "Clone into the target database as it is, even if it isn't empty, leaving what's in it alone. Stops before writing anything if any of it has a name the clone would give.",
+        };
+        var dryRun = new Option<bool>("--dry-run")
+        {
+            Description = "Check the source and target and say what the clone would do, without writing anything.",
+        };
 
         var root = new RootCommand("Clone a SQL Server database, including all objects and data, to another server.")
         {
-            source, target, name, force, parallelism,
+            source, target, name, force, useExisting, parallelism, dryRun,
         };
 
         root.SetAction(async (parseResult, ct) =>
@@ -51,12 +59,20 @@ public static class Cli
                 parseResult.GetValue(target)!,
                 parseResult.GetValue(name)!,
                 parseResult.GetValue(force),
-                Math.Max(1, parseResult.GetValue(parallelism)));
+                Math.Max(1, parseResult.GetValue(parallelism)),
+                parseResult.GetValue(dryRun),
+                parseResult.GetValue(useExisting));
 
             var log = new CloneLog(output, error);
             try
             {
                 var result = await new DatabaseCloner(options, log).CloneAsync(ct);
+                if (options.DryRun)
+                {
+                    log.Info($"Dry run of [{result.SourceDatabase}] to [{options.TargetDatabase}] finished in {result.Elapsed:g}: nothing was written.");
+                    return Success;
+                }
+
                 if (result.Errors.Count == 0)
                 {
                     log.Info($"Cloned [{result.SourceDatabase}] to [{options.TargetDatabase}] in {result.Elapsed:g}.");
