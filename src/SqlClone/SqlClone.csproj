@@ -11,7 +11,7 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>sqlclone</ToolCommandName>
     <PackageId>SqlClone</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Authors>Emmz</Authors>
     <Description>Clone a SQL Server database, schema and data, from one server to another under a new name.</Description>
     <PackageLicenseExpression>MPL-2.0</PackageLicenseExpression>
@@ -35,6 +35,10 @@
 
   <ItemGroup>
     <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="SqlClone.IntegrationTests" />
   </ItemGroup>
 
 </Project>

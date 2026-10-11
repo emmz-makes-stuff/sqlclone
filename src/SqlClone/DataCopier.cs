@@ -4,7 +4,8 @@ using Microsoft.Data.SqlClient;
 namespace SqlClone;
 
 /// <summary>Streams every table from source to target with <see cref="SqlBulkCopy"/>.</summary>
-internal sealed class DataCopier(string sourceConnectionString, string targetConnectionString, int parallelism, CloneLog log)
+internal sealed class DataCopier(string sourceConnectionString, string targetConnectionString, SourceFeatures features,
+    int parallelism, CloneLog log)
 {
     private const SqlBulkCopyOptions BulkOptions =
         SqlBulkCopyOptions.KeepIdentity | SqlBulkCopyOptions.KeepNulls | SqlBulkCopyOptions.TableLock;
@@ -31,7 +32,7 @@ internal sealed class DataCopier(string sourceConnectionString, string targetCon
         await using var source = new SqlConnection(sourceConnectionString);
         await source.OpenAsync(ct);
 
-        var columns = await SourceCatalog.ReadCopyableColumnsAsync(source, table.ObjectId, ct);
+        var columns = await SourceCatalog.ReadCopyableColumnsAsync(source, features, table.ObjectId, ct);
         if (columns.Count == 0) return 0;
 
         // CLR types (hierarchyid, geography, geometry) are moved as their binary serialisation so that the client

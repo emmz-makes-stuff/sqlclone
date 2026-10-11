@@ -38,9 +38,30 @@ internal sealed record ExtendedProperty(
     string? Level1Type, string? Level1Name,
     string? Level2Type, string? Level2Name);
 
+/// <summary>
+/// Catalog columns and views that older versions of SQL Server don't have, probed for directly rather than inferred
+/// from the version number. A server without one of the columns can't have the feature it describes.
+/// </summary>
+internal sealed record SourceFeatures(
+    bool HasExternalTables,         // sys.tables.is_external, 2016
+    bool HasGeneratedAlwaysColumns, // sys.columns.generated_always_type, 2016
+    bool HasGraphColumns,           // sys.columns.graph_type, 2017
+    bool HasSequences,              // sys.sequences, 2012
+    bool HasSequenceLastUsedValue)  // sys.sequences.last_used_value, 2017
+{
+    public static Task<SourceFeatures> ProbeAsync(SqlConnection connection, CancellationToken ct) =>
+        SourceCatalog.SingleAsync(connection, """
+            SELECT COL_LENGTH('sys.tables', 'is_external'), COL_LENGTH('sys.columns', 'generated_always_type'),
+                   COL_LENGTH('sys.columns', 'graph_type'), OBJECT_ID('sys.sequences'),
+                   COL_LENGTH('sys.sequences', 'last_used_value')
+            """, r => new SourceFeatures(!r.IsDBNull(0), !r.IsDBNull(1), !r.IsDBNull(2), !r.IsDBNull(3),
+                !r.IsDBNull(4)), ct);
+}
+
 /// <summary>Reads everything about the source database that is taken from the catalog views rather than SMO.</summary>
 internal sealed class SourceCatalog
 {
+    public required SourceFeatures Features { get; init; }
     public required string Collation { get; init; }
     public required int CompatibilityLevel { get; init; }
     public required IReadOnlyList<string> Schemas { get; init; }
@@ -56,23 +77,21 @@ internal sealed class SourceCatalog
 
     public static async Task<SourceCatalog> ReadAsync(SqlConnection connection, CancellationToken ct)
     {
+        var features = await SourceFeatures.ProbeAsync(connection, ct);
         var (collation, compatibility) = await SingleAsync(connection,
             "SELECT collation_name, CAST(compatibility_level AS int) FROM sys.databases WHERE database_id = DB_ID()",
             r => (r.GetString(0), r.GetInt32(1)), ct);
 
         return new SourceCatalog
         {
+            Features = features,
             Collation = collation,
             CompatibilityLevel = compatibility,
             Schemas = await ListAsync(connection,
                 "SELECT name FROM sys.schemas WHERE schema_id BETWEEN 5 AND 16383 ORDER BY schema_id",
                 r => r.GetString(0), ct),
-            Tables = await ListAsync(connection, """
-                SELECT t.object_id, s.name, t.name
-                FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id
-                WHERE t.is_ms_shipped = 0 AND t.is_external = 0
-                ORDER BY t.object_id
-                """, r => new TableInfo(r.GetInt32(0), r.GetString(1), r.GetString(2)), ct),
+            Tables = await ListAsync(connection, TablesQuery(features),
+                r => new TableInfo(r.GetInt32(0), r.GetString(1), r.GetString(2)), ct),
             Modules = await ListAsync(connection, """
                 SELECT o.object_id, s.name, o.name, RTRIM(o.type), m.definition,
                        m.uses_ansi_nulls, m.uses_quoted_identifier, ps.name, p.name,
@@ -109,11 +128,10 @@ internal sealed class SourceCatalog
                 WHERE t.is_ms_shipped = 0
                 """, r => new IdentityInfo(r.GetString(0), r.GetString(1),
                     r.IsDBNull(2) ? null : r.GetDecimal(2), r.GetDecimal(3)), ct),
-            Sequences = await ListAsync(connection, """
-                SELECT s.name, sq.name, CONVERT(nvarchar(50), sq.current_value)
-                FROM sys.sequences sq JOIN sys.schemas s ON s.schema_id = sq.schema_id
-                WHERE sq.is_ms_shipped = 0 AND sq.last_used_value IS NOT NULL
-                """, r => new SequenceState(r.GetString(0), r.GetString(1), r.GetString(2)), ct),
+            Sequences = SequencesQuery(features) is { } sequences
+                ? await ListAsync(connection, sequences,
+                    r => new SequenceState(r.GetString(0), r.GetString(1), r.GetString(2)), ct)
+                : [],
             Bindings = await ReadBindingsAsync(connection, ct),
             ExtendedProperties = await ReadExtendedPropertiesAsync(connection, ct),
             Unsupported = await ListAsync(connection, """
@@ -130,20 +148,42 @@ internal sealed class SourceCatalog
         };
     }
 
-    public static async Task<IReadOnlyList<ColumnInfo>> ReadCopyableColumnsAsync(SqlConnection connection, int objectId,
-        CancellationToken ct)
+    // The queries below that depend on SourceFeatures are built from fixed fragments only. A filter on a column the
+    // server doesn't have is left out, since nothing there can match it.
+
+    internal static string TablesQuery(SourceFeatures features) => $"""
+        SELECT t.object_id, s.name, t.name
+        FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id
+        WHERE t.is_ms_shipped = 0 {(features.HasExternalTables ? "AND t.is_external = 0" : "")}
+        ORDER BY t.object_id
+        """;
+
+    // Before last_used_value there's no telling whether a sequence has been used, so every one is restored. One that
+    // never was then skips its start value on the clone: a gap, where the alternative risks repeating a used value.
+    internal static string? SequencesQuery(SourceFeatures features) => features.HasSequences
+        ? $"""
+          SELECT s.name, sq.name, CONVERT(nvarchar(50), sq.current_value)
+          FROM sys.sequences sq JOIN sys.schemas s ON s.schema_id = sq.schema_id
+          WHERE sq.is_ms_shipped = 0 {(features.HasSequenceLastUsedValue ? "AND sq.last_used_value IS NOT NULL" : "")}
+          """
+        : null;
+
+    // Computed, rowversion, GENERATED ALWAYS and graph pseudo-columns can't be inserted.
+    internal static string CopyableColumnsQuery(SourceFeatures features) => $"""
+        SELECT c.name, ty.is_assembly_type, c.is_identity
+        FROM sys.columns c JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+        WHERE c.object_id = @id
+          AND c.is_computed = 0
+          AND c.system_type_id <> 189
+          {(features.HasGeneratedAlwaysColumns ? "AND c.generated_always_type = 0" : "")}
+          {(features.HasGraphColumns ? "AND c.graph_type IS NULL" : "")}
+        ORDER BY c.column_id
+        """;
+
+    public static async Task<IReadOnlyList<ColumnInfo>> ReadCopyableColumnsAsync(SqlConnection connection,
+        SourceFeatures features, int objectId, CancellationToken ct)
     {
-        // Computed, rowversion, GENERATED ALWAYS and graph pseudo-columns can't be inserted.
-        await using var cmd = new SqlCommand("""
-            SELECT c.name, ty.is_assembly_type, c.is_identity
-            FROM sys.columns c JOIN sys.types ty ON ty.user_type_id = c.user_type_id
-            WHERE c.object_id = @id
-              AND c.is_computed = 0
-              AND c.system_type_id <> 189
-              AND c.generated_always_type = 0
-              AND c.graph_type IS NULL
-            ORDER BY c.column_id
-            """, connection);
+        await using var cmd = new SqlCommand(CopyableColumnsQuery(features), connection);
         cmd.Parameters.AddWithValue("@id", objectId);
         var columns = new List<ColumnInfo>();
         await using var reader = await cmd.ExecuteReaderAsync(ct);
