@@ -61,8 +61,9 @@ public sealed class DatabaseCloner(CloneOptions options, CloneLog log)
             errors.AddRange(await ScriptExecutor.ExecuteAsync(target, preData, ct));
 
             log.Info($"Copying data for {catalog.Tables.Count} tables...");
+            var rowEstimates = options.Progress ? await SourceCatalog.ReadRowCountsAsync(source, ct) : null;
             var copied = await new DataCopier(options.SourceConnectionString, targetConnectionString, catalog.Features,
-                    options.Parallelism, log)
+                    options.Parallelism, log, rowEstimates)
                 .CopyAsync(catalog.Tables, ct);
             log.Info($"Copied {copied.Values.Sum():N0} rows.");
 

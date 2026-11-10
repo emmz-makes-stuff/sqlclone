@@ -11,6 +11,8 @@ public static class Cli
     public static async Task<int> RunAsync(string[] args, TextWriter? output = null, TextWriter? error = null,
         CancellationToken cancellationToken = default)
     {
+        // Progress bars redraw in place, so they're only for the real console, and only when it's a terminal.
+        var interactive = output is null && !Console.IsOutputRedirected;
         output ??= Console.Out;
         error ??= Console.Error;
 
@@ -46,10 +48,14 @@ public static class Cli
         {
             Description = "Check the source and target and say what the clone would do, without writing anything.",
         };
+        var noProgress = new Option<bool>("--no-progress")
+        {
+            Description = "Report the data copy as plain lines instead of progress bars, even in a terminal.",
+        };
 
         var root = new RootCommand("Clone a SQL Server database, including all objects and data, to another server.")
         {
-            source, target, name, force, useExisting, parallelism, dryRun,
+            source, target, name, force, useExisting, parallelism, dryRun, noProgress,
         };
 
         root.SetAction(async (parseResult, ct) =>
@@ -61,7 +67,8 @@ public static class Cli
                 parseResult.GetValue(force),
                 Math.Max(1, parseResult.GetValue(parallelism)),
                 parseResult.GetValue(dryRun),
-                parseResult.GetValue(useExisting));
+                parseResult.GetValue(useExisting),
+                interactive && !parseResult.GetValue(noProgress));
 
             var log = new CloneLog(output, error);
             try
