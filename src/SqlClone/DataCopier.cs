@@ -5,7 +5,7 @@ namespace SqlClone;
 
 /// <summary>Streams every table from source to target with <see cref="SqlBulkCopy"/>.</summary>
 internal sealed class DataCopier(string sourceConnectionString, string targetConnectionString, SourceFeatures features,
-    int parallelism, CloneLog log)
+    int parallelism, CloneLog log, IReadOnlyDictionary<int, long>? rowEstimates = null)
 {
     private const SqlBulkCopyOptions BulkOptions =
         SqlBulkCopyOptions.KeepIdentity | SqlBulkCopyOptions.KeepNulls | SqlBulkCopyOptions.TableLock;
@@ -15,19 +15,23 @@ internal sealed class DataCopier(string sourceConnectionString, string targetCon
     {
         var copied = new System.Collections.Concurrent.ConcurrentDictionary<TableInfo, long>();
         var done = 0;
+        // Bars only when the caller has row estimates for them, which it does only on an interactive terminal.
+        using var progress = rowEstimates is null ? null : new CopyProgress(log.Output, log, tables, rowEstimates);
 
         await Parallel.ForEachAsync(tables, new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = ct },
             async (table, token) =>
             {
-                var rows = await CopyTableAsync(table, token);
+                var bar = progress?.Start(table);
+                var rows = await CopyTableAsync(table, bar, token);
                 copied[table] = rows;
+                if (bar is not null) progress!.Finish(bar, rows);
                 log.Info($"  [{Interlocked.Increment(ref done)}/{tables.Count}] {table.QualifiedName}: {rows:N0} rows");
             });
 
         return copied;
     }
 
-    private async Task<long> CopyTableAsync(TableInfo table, CancellationToken ct)
+    private async Task<long> CopyTableAsync(TableInfo table, CopyProgress.Active? bar, CancellationToken ct)
     {
         await using var source = new SqlConnection(sourceConnectionString);
         await source.OpenAsync(ct);
@@ -46,7 +50,7 @@ internal sealed class DataCopier(string sourceConnectionString, string targetCon
 
         try
         {
-            await BulkCopyAsync(source, select, table, columns, ct);
+            await BulkCopyAsync(source, select, table, columns, bar, ct);
         }
         catch (SqlException ex) when (ex.Number == 511)
         {
@@ -54,7 +58,8 @@ internal sealed class DataCopier(string sourceConnectionString, string targetCon
             // fits row by row can't be bulk loaded at all. Fall back to INSERTs, which keep small values in-row.
             log.Warn($"{table.QualifiedName} is too wide to bulk load; copying it with INSERT statements instead.");
             await Execute(target, $"DELETE FROM {table.QualifiedName}", ct);
-            await InsertCopyAsync(source, target, select, table, columns, ct);
+            bar?.Report(0);
+            await InsertCopyAsync(source, target, select, table, columns, bar, ct);
         }
 
         await using var count = new SqlCommand($"SELECT COUNT_BIG(*) FROM {table.QualifiedName}", target) { CommandTimeout = 0 };
@@ -62,7 +67,7 @@ internal sealed class DataCopier(string sourceConnectionString, string targetCon
     }
 
     private async Task BulkCopyAsync(SqlConnection source, string select, TableInfo table, IReadOnlyList<ColumnInfo> columns,
-        CancellationToken ct)
+        CopyProgress.Active? bar, CancellationToken ct)
     {
         await using var cmd = new SqlCommand(select, source) { CommandTimeout = 0 };
         await using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess, ct);
@@ -75,17 +80,22 @@ internal sealed class DataCopier(string sourceConnectionString, string targetCon
             EnableStreaming = true,
         };
         foreach (var c in columns) bulk.ColumnMappings.Add(c.Name, c.Name);
+        if (bar is not null)
+        {
+            bulk.NotifyAfter = 1_000;
+            bulk.SqlRowsCopied += (_, e) => bar.Report(e.RowsCopied);
+        }
 
         await bulk.WriteToServerAsync(reader, ct);
     }
 
     private async Task InsertCopyAsync(SqlConnection source, SqlConnection target, string select, TableInfo table,
-        IReadOnlyList<ColumnInfo> columns, CancellationToken ct)
+        IReadOnlyList<ColumnInfo> columns, CopyProgress.Active? bar, CancellationToken ct)
     {
         const int rowsPerTransaction = 500;
         var identity = columns.Any(c => c.IsIdentity);
 
-        // This path is slow, so report progress every 10%; the completion line comes from CopyAsync.
+        // This path is slow, so without a progress bar report every 10%; the completion line comes from CopyAsync.
         long total;
         await using (var count = new SqlCommand($"SELECT COUNT_BIG(*) FROM {table.QualifiedName}", source) { CommandTimeout = 0 })
             total = (long)(await count.ExecuteScalarAsync(ct))!;
@@ -133,9 +143,10 @@ internal sealed class DataCopier(string sourceConnectionString, string targetCon
                     for (var i = 0; i < schema.Count; i++) insert.Parameters[i].Value = reader.GetValue(i);
                     await insert.ExecuteNonQueryAsync(ct);
                     rows++;
+                    bar?.Report(rows);
 
                     var percent = total == 0 ? 0 : (int)(rows * 100 / total) / 10 * 10;
-                    if (percent > reported && percent < 100)
+                    if (bar is null && percent > reported && percent < 100)
                     {
                         reported = percent;
                         log.Info($"  {table.QualifiedName}: {percent}% ({rows:N0}/{total:N0} rows)");

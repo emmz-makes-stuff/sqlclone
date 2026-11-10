@@ -21,6 +21,10 @@ sqlclone --source "Server=src,1433;Database=Sales;User Id=sa;Password=...;TrustS
 | `--use-existing` | | Clone into the target database even though it isn't empty, leaving what's already in it alone, and without changing its collation or compatibility level (a difference is a warning). The database must exist. If anything in it has the same name as something the clone would create (a table, constraint, procedure, schema, type, ...), it stops before writing anything and lists them. Can't be used with `--force`. |
 | `-p`, `--parallelism` | default `4` | Number of tables copied at the same time. |
 | `--dry-run` | | Connect to both servers and say what the clone would do without writing anything: whether the target database would be created, reused or dropped; how many objects it would script; and each table with its row count (from `sys.partitions`, so no table is scanned). Anything that would stop a real clone stops the dry run too, with the same exit code. |
+| `--no-progress` | | Report the data copy as plain lines, one per table, instead of progress bars. Bars are only drawn when stdout is a terminal, so redirected output is always plain. |
+
+In a terminal, the data copy shows a bar for every row across all tables and one for each table being copied. Totals
+come from `sys.partitions`, so they're estimates until each table finishes.
 
 Exit codes: `0` success; `1` the clone could not run (connection failure, target not empty, ...); `2` the clone ran
 but some objects failed, and each one is listed on stderr.
